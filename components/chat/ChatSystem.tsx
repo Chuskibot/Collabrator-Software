@@ -16,6 +16,7 @@ import {
   useBroadcastEvent 
 } from '@liveblocks/react/suspense';
 import { ChatMessage } from '@/liveblocks.config';
+import { formatDistanceToNow } from '@/lib/utils';
 
 // Types
 export interface User {
@@ -65,38 +66,66 @@ export interface Conversation {
 const ChatSystem = () => {
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
-  const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [newMessage, setNewMessage] = useState('');
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
   const [isAttachmentDrawerOpen, setIsAttachmentDrawerOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
   const [isRecording, setIsRecording] = useState(false);
-  const messageEndRef = useRef<HTMLDivElement>(null);
+  const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
+  const [showNotification, setShowNotification] = useState(false);
+  const [notificationMessage, setNotificationMessage] = useState<{sender: string; content: string} | null>(null);
+  const [notifications, setNotifications] = useState<Array<{
+    id: string;
+    sender: string;
+    avatar: string;
+    content: string;
+    timestamp: Date;
+    read: boolean;
+  }>>([]);
   
-  // Liveblocks hooks
-  const [myPresence, updateMyPresence] = useMyPresence();
-  const others = useOthers();
-  const self = useSelf();
-  const broadcast = useBroadcastEvent();
+  const messageEndRef = useRef<HTMLDivElement>(null);
+  const notificationSoundRef = useRef<HTMLAudioElement | null>(null);
+  const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Initialize notification sound
+  useEffect(() => {
+    notificationSoundRef.current = new Audio('/assets/sounds/notification.mp3');
+    
+    // Clean up timeouts on unmount
+    return () => {
+      if (notificationTimeoutRef.current) {
+        clearTimeout(notificationTimeoutRef.current);
+      }
+    };
+  }, []);
   
   // Get chat messages from Liveblocks storage
-  const chatMessages = useStorage((root) => root.chatMessages || []);
+  const chatMessages = useStorage((root) => root.chatMessages);
   
-  // Create a conversation from the chat messages
+  // Get other users in the room
+  const others = useOthers();
+  
+  // Get current user
+  const self = useSelf();
+  
+  // Set typing status
+  const [{ isTyping }, updateMyPresence] = useMyPresence();
+  
+  // Broadcast typing events
+  const broadcast = useBroadcastEvent();
+  
+  // Create a conversation from Liveblocks messages
   const createConversationFromMessages = useCallback(() => {
-    if (!chatMessages || !self) return null;
+    if (!chatMessages) return null;
     
-    // Convert Liveblocks users to our User type
+    // Create participants list from others and self
     const participants: User[] = others.map(other => ({
       id: other.id,
-      name: other.info?.name || 'Unknown User',
-      avatar: other.info?.avatar || '/assets/icons/user.svg',
+      name: other.info.name,
+      avatar: other.info.avatar,
       isOnline: true,
     }));
     
-    // Add current user to participants
-    if (self.info) {
+    if (self?.info) {
       participants.push({
         id: self.id,
         name: self.info.name,
@@ -142,7 +171,7 @@ const ChatSystem = () => {
       messages,
       unreadCount: 0,
       isTyping,
-      lastMessageTimestamp: messages.length > 0 ? messages[0].timestamp : new Date(),
+      lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : new Date(),
     };
   }, [chatMessages, others, self]);
   
@@ -150,30 +179,145 @@ const ChatSystem = () => {
   useEffect(() => {
     const conversation = createConversationFromMessages();
     if (conversation) {
+      // Check if there's a new message
+      if (activeConversation && conversation.messages.length > activeConversation.messages.length) {
+        const latestMessage = conversation.messages[0];
+        
+        // Show notification for all messages except our own
+        if (latestMessage.sender.id !== self?.id) {
+          // Show notification regardless of chat open state
+          setNotificationMessage({
+            sender: latestMessage.sender.name,
+            content: latestMessage.content.length > 30 
+              ? latestMessage.content.substring(0, 30) + '...' 
+              : latestMessage.content
+          });
+          setShowNotification(true);
+          
+          // Play notification sound
+          if (notificationSoundRef.current) {
+            notificationSoundRef.current.play().catch(err => console.error("Error playing notification sound:", err));
+          }
+          
+          // Vibrate for mobile devices (if supported)
+          if (navigator.vibrate) {
+            navigator.vibrate([100, 50, 100]);
+          }
+          
+          // Hide notification after 5 seconds
+          setTimeout(() => {
+            setShowNotification(false);
+          }, 5000);
+          
+          // Scroll to the latest message if chat is open
+          if (isChatOpen && !isMinimized) {
+            setTimeout(() => {
+              messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            }, 100);
+          }
+        }
+      }
+      
       setActiveConversation(conversation);
     }
-  }, [chatMessages, createConversationFromMessages]);
+  }, [chatMessages, createConversationFromMessages, activeConversation, self, isChatOpen, isMinimized]);
   
-  // Listen for typing events
+  // Scroll to bottom of messages when opening chat or when minimized state changes
+  useEffect(() => {
+    if (isChatOpen && !isMinimized) {
+      setTimeout(() => {
+        messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 300);
+    }
+  }, [isChatOpen, isMinimized]);
+  
+  // Listen for typing events and new message notifications
   useEventListener(({ event }) => {
     if (event.type === "TYPING_START" || event.type === "TYPING_STOP") {
       // The typing status is already reflected in the others' presence
       // which will trigger a re-render and update the conversation
+    } else if (event.type === "NEW_MESSAGE") {
+      // If the chat is not open or minimized, show a notification
+      const { sender, content } = event.data;
+      
+      // Only show notification for messages from others, not our own
+      if (sender.id !== self?.id) {
+        // Create unique ID for this notification
+        const notificationId = nanoid();
+        
+        // Add to notifications array
+        const newNotification = {
+          id: notificationId,
+          sender: sender.name,
+          avatar: sender.avatar,
+          content: content.length > 60 ? content.substring(0, 60) + '...' : content,
+          timestamp: new Date(),
+          read: false
+        };
+        
+        // Add to notifications list
+        setNotifications(prev => [newNotification, ...prev.slice(0, 9)]); // Keep last 10 notifications
+        
+        // Show toast notification
+        setNotificationMessage({
+          sender: sender.name,
+          content: content.length > 60 ? content.substring(0, 60) + '...' : content
+        });
+        setShowNotification(true);
+        
+        // Play notification sound if chat is not focused
+        if ((!isChatOpen || isMinimized) && notificationSoundRef.current) {
+          notificationSoundRef.current.play().catch(err => console.error("Error playing notification sound:", err));
+        }
+        
+        // Vibrate for mobile devices (if supported)
+        if (navigator.vibrate) {
+          navigator.vibrate([100, 50, 100]);
+        }
+        
+        // Clear any existing timeout
+        if (notificationTimeoutRef.current) {
+          clearTimeout(notificationTimeoutRef.current);
+        }
+        
+        // Hide notification after 5 seconds
+        notificationTimeoutRef.current = setTimeout(() => {
+          setShowNotification(false);
+        }, 5000);
+      }
     }
   });
   
-  // Scroll to bottom of messages when changing conversations or new messages arrive
+  // Mark all notifications as read when opening chat
   useEffect(() => {
-    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeConversation]);
+    if (isChatOpen && !isMinimized) {
+      setNotifications(prev => 
+        prev.map(notification => ({ ...notification, read: true }))
+      );
+    }
+  }, [isChatOpen, isMinimized]);
   
   const toggleChat = () => {
     setIsChatOpen(!isChatOpen);
     if (isMinimized) setIsMinimized(false);
+    
+    // If opening the chat, ensure we scroll to the latest messages
+    if (!isChatOpen) {
+      setTimeout(() => {
+        messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 300);
+    }
   };
   
   const toggleMinimize = () => {
     setIsMinimized(!isMinimized);
+    
+    // If un-minimizing, ensure we scroll to the latest messages
+    if (isMinimized) {
+      setTimeout(() => {
+        messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 300);
+    }
   };
   
   // Add a new message to the chat
@@ -200,23 +344,39 @@ const ChatSystem = () => {
     // Add the message to storage
     storage.get('chatMessages').push(newMessage);
     
-    // Reset typing status
-    updateMyPresence({ isTyping: false });
+    // Broadcast a notification to all users
+    broadcast({
+      type: "NEW_MESSAGE",
+      data: {
+        sender: {
+          id: self.id,
+          name: self.info.name,
+          avatar: self.info.avatar
+        },
+        content
+      }
+    });
   }, [self, isRecording]);
   
+  // Handle sending a message
   const handleSendMessage = () => {
-    if (!newMessage.trim() && !isRecording) return;
-    
-    const content = isRecording ? '[Voice Message]' : newMessage;
-    
-    // Add the message to Liveblocks storage
-    addMessage(content);
-    
-    // Clear the input
-    setNewMessage('');
-    setIsRecording(false);
+    if (newMessage.trim() || isRecording) {
+      addMessage(newMessage);
+      setNewMessage('');
+      setIsRecording(false);
+      
+      // Reset typing status
+      updateMyPresence({ isTyping: false });
+      broadcast({ type: "TYPING_STOP" });
+      
+      // Scroll to the latest message
+      setTimeout(() => {
+        messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
+    }
   };
   
+  // Handle key press in the message input
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -224,164 +384,288 @@ const ChatSystem = () => {
     }
   };
   
-  // Handle typing status
-  const handleTyping = useCallback((value: string) => {
-    setNewMessage(value);
-    
-    // Update typing status
-    const isTyping = value.length > 0;
-    if (isTyping !== myPresence.isTyping) {
-      updateMyPresence({ isTyping });
-      broadcast({ type: isTyping ? "TYPING_START" : "TYPING_STOP" });
-    }
-  }, [myPresence.isTyping, updateMyPresence, broadcast]);
-  
-  const toggleNotifications = () => {
-    setNotificationsEnabled(!notificationsEnabled);
+  // Toggle recording state
+  const toggleRecording = () => {
+    setIsRecording(!isRecording);
   };
   
+  // Add emoji to message
   const addEmoji = (emoji: string) => {
     setNewMessage(prev => prev + emoji);
     setIsEmojiPickerOpen(false);
   };
   
-  const toggleRecording = () => {
-    setIsRecording(!isRecording);
+  // Create current user object
+  const currentUser: User = {
+    id: self?.id || 'current-user',
+    name: self?.info?.name || 'You',
+    avatar: self?.info?.avatar || '/assets/icons/user.svg',
+    isOnline: true,
   };
   
-  // Filter conversations based on search query
-  const filteredConversations = activeConversation && searchQuery
-    ? searchQuery.toLowerCase() !== ''
-      ? {
-          ...activeConversation,
-          messages: activeConversation.messages.filter(msg => 
-            msg.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            msg.sender.name.toLowerCase().includes(searchQuery.toLowerCase())
-          )
-        }
-      : activeConversation
-    : activeConversation;
-  
-  // Check if there are unread messages
-  const hasUnreadMessages = activeConversation?.unreadCount && activeConversation.unreadCount > 0;
-
   return (
-    <>
-      {/* Chat bubble button - always visible */}
+    <div className="chat-system">
+      {/* Notification */}
+      <AnimatePresence>
+        {showNotification && notificationMessage && (
+          <motion.div 
+            initial={{ opacity: 0, y: 50, x: 20 }}
+            animate={{ opacity: 1, y: 0, x: 0 }}
+            exit={{ opacity: 0, y: 20, x: 0 }}
+            transition={{ 
+              type: "spring", 
+              stiffness: 500, 
+              damping: 30 
+            }}
+            className="fixed bottom-24 right-6 z-50 bg-white dark:bg-gray-800 rounded-lg shadow-lg p-4 border border-gray-200 dark:border-gray-700 max-w-xs"
+            onClick={() => {
+              setShowNotification(false);
+              setIsChatOpen(true);
+              if (isMinimized) setIsMinimized(false);
+              
+              // Mark this notification as read
+              setNotifications(prev => 
+                prev.map(notification => 
+                  notification.sender === notificationMessage.sender && 
+                  notification.content === notificationMessage.content
+                    ? { ...notification, read: true }
+                    : notification
+                )
+              );
+            }}
+          >
+            <div className="flex items-start gap-3">
+              <div className="relative">
+                <motion.div 
+                  className="h-10 w-10 rounded-full bg-blue-100 flex items-center justify-center text-blue-500 overflow-hidden"
+                  animate={{ 
+                    boxShadow: ['0 0 0 0 rgba(59, 130, 246, 0.5)', '0 0 0 10px rgba(59, 130, 246, 0)'],
+                  }}
+                  transition={{
+                    duration: 1.5,
+                    repeat: Infinity,
+                    repeatType: "loop"
+                  }}
+                >
+                  {notificationMessage.sender.charAt(0).toUpperCase()}
+                </motion.div>
+                <span className="absolute bottom-0 right-0 h-3 w-3 rounded-full bg-green-500 border-2 border-white dark:border-gray-800"></span>
+              </div>
+              <div className="flex-1">
+                <div className="flex justify-between items-start">
+                  <h4 className="font-medium text-gray-900 dark:text-gray-100">{notificationMessage.sender}</h4>
+                  <span className="text-xs text-gray-500">just now</span>
+                </div>
+                <p className="text-sm text-gray-600 dark:text-gray-300 mt-1">{notificationMessage.content}</p>
+              </div>
+            </div>
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-400 to-purple-500">
+              <motion.div 
+                className="h-full bg-gradient-to-r from-blue-500 to-purple-600"
+                initial={{ width: "100%" }}
+                animate={{ width: "0%" }}
+                transition={{ duration: 5, ease: "linear" }}
+              />
+            </div>
+            <div className="absolute bottom-1 right-3">
+              <motion.span 
+                className="text-xs text-blue-500 cursor-pointer font-medium"
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+              >
+                Open Chat
+              </motion.span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Notifications Badge */}
+      <div className="fixed bottom-24 right-6 z-40">
+        <AnimatePresence>
+          {notifications.some(n => !n.read) && !isChatOpen && (
+            <motion.div
+              initial={{ scale: 0, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0, opacity: 0 }}
+              className="bg-red-500 text-white rounded-full py-1 px-3 text-xs font-medium shadow-lg"
+              onClick={() => {
+                setIsChatOpen(true);
+                if (isMinimized) setIsMinimized(false);
+              }}
+            >
+              {notifications.filter(n => !n.read).length} new {notifications.filter(n => !n.read).length === 1 ? 'message' : 'messages'}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Chat toggle button */}
       <button 
         onClick={toggleChat}
-        className="fixed bottom-6 right-6 size-14 rounded-full bg-gradient-to-r from-blue-500 to-purple-500 shadow-lg flex items-center justify-center text-white z-50 hover:shadow-xl transition-all duration-300"
+        className="chat-toggle-button fixed bottom-6 right-6 z-50 flex items-center justify-center w-14 h-14 rounded-full bg-blue-500 text-white shadow-lg hover:bg-blue-600 transition-all duration-300"
       >
         <MessageCircle size={24} />
-        {!isChatOpen && hasUnreadMessages && (
-          <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full size-5 flex items-center justify-center animate-pulse">
-            {activeConversation?.unreadCount}
-          </span>
+        {notifications.some(n => !n.read) && (
+          <motion.span 
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{
+              type: "spring",
+              stiffness: 500,
+              damping: 20
+            }}
+            className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center"
+          >
+            {notifications.filter(n => !n.read).length}
+          </motion.span>
         )}
       </button>
+      
+      {/* Notification Center */}
+      <AnimatePresence>
+        {isChatOpen && !isMinimized && notifications.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="fixed top-4 right-4 z-50 bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 w-80"
+            style={{ maxHeight: 'calc(100vh - 200px)' }}
+          >
+            <div className="p-3 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+              <h3 className="font-medium text-gray-900 dark:text-gray-100">Recent Notifications</h3>
+              <button 
+                className="text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                onClick={() => setNotifications([])}
+              >
+                Clear All
+              </button>
+            </div>
+            <div className="overflow-y-auto p-2" style={{ maxHeight: 'calc(100vh - 250px)' }}>
+              {notifications.length > 0 ? (
+                notifications.map(notification => (
+                  <div 
+                    key={notification.id}
+                    className={`p-3 mb-2 rounded-lg cursor-pointer transition-colors ${
+                      notification.read 
+                        ? 'bg-gray-50 dark:bg-gray-700' 
+                        : 'bg-blue-50 dark:bg-blue-900/30'
+                    }`}
+                    onClick={() => {
+                      // Mark as read
+                      setNotifications(prev => 
+                        prev.map(n => 
+                          n.id === notification.id
+                            ? { ...n, read: true }
+                            : n
+                        )
+                      );
+                    }}
+                  >
+                    <div className="flex items-start gap-2">
+                      <div className="h-8 w-8 rounded-full bg-blue-100 dark:bg-blue-800 flex items-center justify-center text-blue-500 dark:text-blue-300">
+                        {notification.sender.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex justify-between">
+                          <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{notification.sender}</p>
+                          <p className="text-xs text-gray-500">
+                            {formatDistanceToNow(notification.timestamp)} ago
+                          </p>
+                        </div>
+                        <p className="text-sm text-gray-600 dark:text-gray-300 mt-1">
+                          {notification.content}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="p-4 text-center text-gray-500">
+                  No notifications
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-      {/* Main chat window */}
+      {/* Chat window */}
       <AnimatePresence>
         {isChatOpen && (
-          <motion.div
+          <motion.div 
             initial={{ opacity: 0, y: 20, scale: 0.95 }}
             animate={isMinimized 
-              ? { opacity: 1, y: 0, scale: 0.95, height: '60px' }
+              ? { opacity: 1, y: 0, scale: 0.95, height: 'auto' }
               : { opacity: 1, y: 0, scale: 1, height: 'auto' }
             }
             exit={{ opacity: 0, y: 20, scale: 0.95 }}
             transition={{ duration: 0.2 }}
-            className={cn(
-              "fixed bottom-24 right-6 w-96 rounded-2xl bg-white shadow-2xl z-40 flex flex-col overflow-hidden",
-              isMinimized ? "max-h-[60px]" : "max-h-[600px]"
-            )}
+            className={`chat-window fixed bottom-24 right-6 z-50 w-[380px] rounded-2xl overflow-hidden bg-white dark:bg-gray-800 shadow-2xl border border-gray-200 dark:border-gray-700 flex flex-col ${
+              isMinimized ? 'h-14' : 'h-[500px]'
+            }`}
           >
             {/* Chat header */}
-            <div className="h-15 bg-gradient-to-r from-blue-500 to-purple-500 flex items-center justify-between px-4 py-3">
-              <div className="flex items-center gap-2">
-                <MessageCircle size={20} className="text-white" />
-                <h3 className="text-white font-semibold">Team Chat</h3>
+            <div className="chat-header flex items-center justify-between p-3 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+              <div className="flex items-center">
+                <MessageCircle size={20} className="text-blue-500 mr-2" />
+                <h3 className="font-medium text-gray-800 dark:text-gray-200">Chat</h3>
               </div>
-              <div className="flex items-center gap-2">
-                <button onClick={toggleNotifications} className="text-white hover:bg-white/10 rounded-full p-1.5 transition-colors">
-                  {notificationsEnabled ? <Bell size={16} /> : <BellOff size={16} />}
+              <div className="flex items-center gap-1">
+                <button 
+                  onClick={() => setIsChatOpen(false)}
+                  className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 transition-colors"
+                >
+                  <Bell size={16} />
                 </button>
-                <button onClick={toggleMinimize} className="text-white hover:bg-white/10 rounded-full p-1.5 transition-colors">
-                  <Minimize2 size={16} />
+                <button 
+                  onClick={toggleMinimize}
+                  className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 transition-colors"
+                >
+                  {isMinimized ? <MessageCircle size={16} /> : <Minimize2 size={16} />}
                 </button>
-                <button onClick={toggleChat} className="text-white hover:bg-white/10 rounded-full p-1.5 transition-colors">
+                <button 
+                  onClick={() => setIsChatOpen(false)}
+                  className="p-1.5 rounded-full hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 transition-colors"
+                >
                   <X size={16} />
                 </button>
               </div>
             </div>
-
-            {/* Chat content area - hidden when minimized */}
-            <AnimatePresence>
-              {!isMinimized && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  transition={{ duration: 0.2 }}
-                  className="flex flex-col h-[calc(600px-60px)]"
-                >
-                  {/* Search bar */}
-                  <div className="p-3 border-b">
-                    <div className="relative">
-                      <input
-                        type="text"
-                        placeholder="Search messages..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        className="w-full py-2 pl-8 pr-4 bg-gray-100 rounded-full text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      />
-                      <Search size={16} className="absolute left-2.5 top-2.5 text-gray-500" />
-                    </div>
-                  </div>
-
-                  {/* Main content area */}
-                  <div className="flex h-[430px]">
-                    {/* Message window - full width */}
-                    {activeConversation ? (
-                      <MessageWindow
-                        conversation={filteredConversations || activeConversation}
-                        currentUser={self?.info ? {
-                          id: self.id,
-                          name: self.info.name,
-                          avatar: self.info.avatar,
-                          isOnline: true,
-                        } : {
-                          id: 'current-user',
-                          name: 'You',
-                          avatar: '/assets/icons/user.svg',
-                          isOnline: true,
-                        }}
-                        onSendMessage={handleSendMessage}
-                        newMessage={newMessage}
-                        setNewMessage={handleTyping}
-                        isEmojiPickerOpen={isEmojiPickerOpen}
-                        setIsEmojiPickerOpen={setIsEmojiPickerOpen}
-                        isAttachmentDrawerOpen={isAttachmentDrawerOpen}
-                        setIsAttachmentDrawerOpen={setIsAttachmentDrawerOpen}
-                        onKeyPress={handleKeyPress}
-                        isRecording={isRecording}
-                        toggleRecording={toggleRecording}
-                        addEmoji={addEmoji}
-                        messageEndRef={messageEndRef}
-                      />
-                    ) : (
-                      <div className="flex-grow flex items-center justify-center p-4 bg-gray-50">
-                        <p className="text-gray-500 text-center">Loading chat...</p>
-                      </div>
-                    )}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+            
+            {/* Chat content */}
+            {!isMinimized && activeConversation && (
+              <MessageWindow 
+                conversation={activeConversation}
+                currentUser={currentUser}
+                onSendMessage={handleSendMessage}
+                newMessage={newMessage}
+                setNewMessage={(value) => {
+                  setNewMessage(value);
+                  // Update typing status based on the new value
+                  if (value.trim() && !isTyping) {
+                    updateMyPresence({ isTyping: true });
+                    broadcast({ type: "TYPING_START" });
+                  } else if (!value.trim() && isTyping) {
+                    updateMyPresence({ isTyping: false });
+                    broadcast({ type: "TYPING_STOP" });
+                  }
+                }}
+                isEmojiPickerOpen={isEmojiPickerOpen}
+                setIsEmojiPickerOpen={setIsEmojiPickerOpen}
+                isAttachmentDrawerOpen={isAttachmentDrawerOpen}
+                setIsAttachmentDrawerOpen={setIsAttachmentDrawerOpen}
+                onKeyPress={handleKeyPress}
+                isRecording={isRecording}
+                toggleRecording={toggleRecording}
+                addEmoji={addEmoji}
+                messageEndRef={messageEndRef}
+              />
+            )}
           </motion.div>
         )}
       </AnimatePresence>
-    </>
+    </div>
   );
 };
 
