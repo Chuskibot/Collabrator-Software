@@ -468,7 +468,7 @@ const AIChatbot = () => {
                   </button>
                 </div>
                 <div className="text-xs text-center mt-2 text-gray-400">
-                  Powered by Google Gemini AI
+                  Powered by Varendra University
                 </div>
               </div>
             )}
